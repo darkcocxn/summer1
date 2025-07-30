@@ -1,0 +1,215 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import butter, lfilter
+from scipy.interpolate import interp1d
+
+# --- 0. 参数配置 ---
+# 地震波参数
+DURATION = 40.0  # 总时长 (s)
+DT = 0.01  # 时间步长 (s)
+N_POINTS = int(DURATION / DT)  # 总点数
+T = np.arange(0, DURATION, DT)  # 时间序列
+
+# SDOF系统参数 (用于计算反应谱)
+DAMPING_RATIO = 0.05  # 阻尼比
+
+# Kanai-Tajimi 滤波器参数 (场地卓越周期和阻尼)
+OMEGA_G = 15.0  # rad/s (对应卓越周期约0.42s的坚硬场地)
+XI_G = 0.6  # 场地阻尼
+
+# 时域包络函数参数 (梯形)
+T1 = 3.0  # 到达最大强度时间
+T2 = 15.0  # 强震持续结束时间
+T_ENV = DURATION  # 包络总长
+
+# 迭代控制参数
+MAX_ITERATIONS = 20  # 最大迭代次数
+TOLERANCE = 0.10  # 误差容忍度 (10%)
+
+
+# --- 核心功能函数 ---
+
+def calculate_response_spectrum(accel, dt, periods, damping_ratio):
+    """计算单自由度系统的反应谱 (使用频域方法)."""
+    sa = []
+    accel_fft = np.fft.rfft(accel)
+    freqs = np.fft.rfftfreq(len(accel), dt)
+
+    for T_period in periods:
+        if T_period == 0:
+            sa.append(abs(accel[0]))
+            continue
+
+        omega_n = 2 * np.pi / T_period
+
+        # SDOF传递函数 H(w)
+        h_iw = -1 / (-freqs ** 2 * (2 * np.pi) ** 2 + 2j * damping_ratio * omega_n * freqs * 2 * np.pi + omega_n ** 2)
+
+        disp_fft = accel_fft * h_iw
+        disp = np.fft.irfft(disp_fft, len(accel))
+
+        # 谱加速度 Sa = omega^2 * max(|disp|)
+        sa.append((omega_n ** 2) * np.max(np.abs(disp)))
+
+    return np.array(sa) / 9.81  # 返回以g为单位的结果
+
+
+def get_envelope_function(t_series, t1, t2, t_total):
+    """生成梯形时域包络函数."""
+    envelope = np.zeros_like(t_series   )
+    for i, t in enumerate(t_series):
+        if 0 <= t < t1:
+            envelope[i] = t / t1
+        elif t1 <= t < t2:
+            envelope[i] = 1.0
+        elif t2 <= t < t_total:
+            envelope[i] = 1.0 - (t - t2) / (t_total - t2)
+    return envelope
+
+
+def baseline_correction(accel, dt):
+    """对加速度时程进行基线校正."""
+    # 使用4阶高通巴特沃斯滤波器，截止频率为0.1Hz
+    nyquist = 0.5 / dt
+    cutoff_freq = 0.1
+    b, a = butter(4, cutoff_freq / nyquist, btype='high')
+    corrected_accel = lfilter(b, a, accel)
+    return corrected_accel
+
+
+def main():
+    """主执行函数"""
+    print("开始生成人工地震波...")
+
+    # --- 加载目标反应谱 ---
+    try:
+        periods_target, sa_target_g = np.loadtxt('target_spectrum.txt', delimiter=',', unpack=True, comments='#')
+        print("1. 目标反应谱文件 'target_spectrum.txt' 加载成功。")
+    except FileNotFoundError:
+        print("错误: 未找到 'target_spectrum.txt' 文件。请按说明创建该文件。")
+        return
+
+    # --- 步骤 1: 生成高斯白噪声 ---
+    white_noise = np.random.randn(N_POINTS)
+    print("2. 步骤1: 高斯白噪声生成完毕。")
+
+    # --- 步骤 2: 在频域进行整形 (Kanai-Tajimi 滤波) ---
+    noise_fft = np.fft.rfft(white_noise)
+    freqs = np.fft.rfftfreq(N_POINTS, DT)
+    omega = 2 * np.pi * freqs
+
+    # Kanai-Tajimi 滤波器传递函数
+    h_kt = (1 + 2j * XI_G * (omega / OMEGA_G)) / \
+           ((1 - (omega / OMEGA_G) ** 2) + 2j * XI_G * (omega / OMEGA_G))
+
+    # Clough-Penzien 修正 (可选，这里简化为KT谱)
+
+    shaped_fft = noise_fft * h_kt
+    print("3. 步骤2: 频域整形 (Kanai-Tajimi) 完成。")
+
+    # --- 步骤 3 & 4: 时域整形 与 迭代匹配目标谱 ---
+    print("4. 进入步骤3和4的迭代循环...")
+
+    # 插值目标谱以匹配我们计算用的周期点
+    interp_target_sa_func = interp1d(periods_target, sa_target_g, kind='linear', fill_value="extrapolate")
+
+    final_accel = None
+
+    for i in range(MAX_ITERATIONS):
+        # 从频域转回时域
+        current_signal = np.fft.irfft(shaped_fft, N_POINTS)
+
+        # 步骤 3: 应用时域包络函数
+        envelope = get_envelope_function(T, T1, T2, DURATION)
+        current_accel_raw = current_signal * envelope
+
+        # 标准化，使其PGA约为1.0g，方便后续缩放
+        if np.max(np.abs(current_accel_raw)) > 0:
+            current_accel_norm = current_accel_raw / np.max(np.abs(current_accel_raw))
+        else:
+            current_accel_norm = current_accel_raw
+
+        # 步骤 4.1: 计算当前人工波的反应谱
+        calculated_sa = calculate_response_spectrum(current_accel_norm * 9.81, DT, periods_target, DAMPING_RATIO)
+
+        # 步骤 4.2: 比较并检查收敛性
+        error = np.mean(np.abs(calculated_sa - sa_target_g) / sa_target_g)
+        print(f"   迭代 {i + 1}/{MAX_ITERATIONS}: 平均误差 = {error:.2%}")
+
+        if error < TOLERANCE:
+            print("   误差已在容忍度内，迭代结束。")
+            final_accel = current_accel_norm
+            break
+
+        # 步骤 4.3: 调整傅里叶谱
+        correction_ratio = sa_target_g / (calculated_sa + 1e-6)  # 避免除以0
+
+        # 插值修正系数以匹配FFT的频率点
+        interp_ratio_func = interp1d(periods_target, correction_ratio, kind='linear', fill_value="extrapolate")
+        fft_periods = 1.0 / (freqs + 1e-6)
+        fft_correction_ratio = interp_ratio_func(fft_periods)
+
+        # 应用修正
+        shaped_fft *= fft_correction_ratio
+
+        if i == MAX_ITERATIONS - 1:
+            print("   达到最大迭代次数，退出循环。")
+            final_accel = current_accel_norm
+
+    # --- 缩放最终的加速度时程以匹配目标谱的整体水平 ---
+    final_sa = calculate_response_spectrum(final_accel * 9.81, DT, periods_target, DAMPING_RATIO)
+    scaling_factor = np.sum(sa_target_g) / np.sum(final_sa)
+    final_accel *= scaling_factor
+    print("5. 迭代匹配完成，并对最终波形进行了缩放。")
+
+    # --- 步骤 5: 基线校正 ---
+    corrected_accel = baseline_correction(final_accel, DT)
+    print("6. 步骤5: 基线校正完成。")
+
+    # --- 7. 绘图展示结果 ---
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, axs = plt.subplots(3, 1, figsize=(12, 15))
+
+    # 图1: 反应谱对比
+    axs[0].plot(periods_target, sa_target_g, 'r-o', label='目标反应谱')
+    final_spectrum = calculate_response_spectrum(corrected_accel * 9.81, DT, periods_target, DAMPING_RATIO)
+    axs[0].plot(periods_target, final_spectrum, 'b--^', label=f'生成波反应谱 (误差 {error:.2%})')
+    axs[0].set_xlabel('周期 (s)')
+    axs[0].set_ylabel('谱加速度 Sa (g)')
+    axs[0].set_title('反应谱对比')
+    axs[0].legend()
+    axs[0].set_xscale('log')
+    axs[0].set_yscale('log')
+
+    # 图2: 加速度时程
+    pga = np.max(np.abs(corrected_accel))
+    axs[1].plot(T, corrected_accel)
+    axs[1].set_xlabel('时间 (s)')
+    axs[1].set_ylabel('加速度 (g)')
+    axs[1].set_title(f'生成的人工地震波加速度时程 (PGA = {pga:.3f}g)')
+
+    # 图3: 速度与位移时程
+    velocity = np.cumsum(corrected_accel * 9.81) * DT
+    displacement = np.cumsum(velocity) * DT
+    ax2_twin = axs[2].twinx()
+    p1, = axs[2].plot(T, velocity, 'g-', label='速度')
+    p2, = ax2_twin.plot(T, displacement, 'm-', label='位移')
+    axs[2].set_xlabel('时间 (s)')
+    axs[2].set_ylabel('速度 (m/s)', color='g')
+    ax2_twin.set_ylabel('位移 (m)', color='m')
+    axs[2].set_title('速度与位移时程 (经基线校正)')
+    axs[2].legend(handles=[p1, p2])
+
+    fig.tight_layout()
+    plt.show()
+
+    # 保存结果到文件
+    np.savetxt('generated_accelerogram.txt',
+               np.vstack((T, corrected_accel)).T,
+               header='Time (s), Acceleration (g)',
+               fmt='%.6f')
+    print("最终人工波已保存到 'generated_accelerogram.txt'")
+
+
+if __name__ == '__main__':
+    main()

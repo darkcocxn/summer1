@@ -1,0 +1,334 @@
+# -*- coding: utf-8 -*-
+import os
+import torch
+import numpy as np
+import openseespy.opensees as ops
+import gym
+from gym import spaces
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.evaluation import evaluate_policy
+
+# Ensure PyTorch uses CPU to avoid issues on machines without a GPU
+# If you have a CUDA-enabled GPU, you can comment out the line below
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+
+# ==================================================================
+# --- 1. Custom OpenSees Reinforcement Learning Environment ---
+# ==================================================================
+class OpenSeesEnv(gym.Env):
+    """
+    A custom reinforcement learning environment based on OpenSees.
+
+    This environment simulates the nonlinear dynamic response of a multi-story shear building.
+    - **State (Observation)**: The physical properties of the building, including the height and mass of each floor.
+    - **Action**: Engineering parameters for the structure, specifically the shear stiffness for each of the 5 floors.
+    - **Reward**: The reward is based on the structure's performance under seismic loading (maximum inter-story drift).
+      It is designed as a negative value since the goal is to minimize the drift.
+    """
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, num_floors=5, quiet=False):
+        """
+        Initializes the environment.
+
+        Parameters:
+        ----------
+        num_floors : int
+            The total number of floors in the building. For this version, it's fixed to 5.
+        quiet: bool
+            If True, suppress print statements during simulation steps.
+        """
+        super(OpenSeesEnv, self).__init__()
+
+        # --- Environment Parameters ---
+        self.num_floors = num_floors
+        self.quiet = quiet
+        if self.num_floors != 5:
+            raise ValueError("This environment is configured for a 5-story building.")
+
+        self.state = None  # Initialized in reset()
+
+        # --- Define Action Space ---
+        # Action: [k_shear_floor1, k_shear_floor2, ..., k_shear_floor5]
+        # k_shear: Elastic horizontal shear stiffness (N/m) for each floor.
+        low_action = np.array([1.0e6] * self.num_floors, dtype=np.float32)
+        high_action = np.array([1.0e8] * self.num_floors, dtype=np.float32)
+        self.action_space = spaces.Box(low=low_action, high=high_action, dtype=np.float32)
+
+        # --- Define Observation Space ---
+        # State: [floor_height_1, ..., floor_height_n, mass_per_floor_1, ..., mass_per_floor_n]
+        low_obs = np.array(
+            [2.5] * self.num_floors + [800.0] * self.num_floors, dtype=np.float32
+        )
+        high_obs = np.array(
+            [4.0] * self.num_floors + [1500.0] * self.num_floors, dtype=np.float32
+        )
+        self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
+
+        if not self.quiet:
+            print("--- Reinforcement Learning Environment Initialized ---")
+            print(f"Number of floors: {self.num_floors}")
+            print(f"Action Space Shape: {self.action_space.shape}")
+            print(f"Observation Space Shape: {self.observation_space.shape}")
+            print("-" * 50)
+
+    def reset(self, seed=None):
+        """
+        Resets the environment to a new random initial state.
+        """
+        # [FIX] Use the modern seeding API provided by gym.Env.
+        # This is more robust and avoids conflicts with multiprocessing.
+        super().reset(seed=seed)
+
+        # 1. Randomly generate state variables using the environment's random number generator
+        floor_heights = self.np_random.uniform(low=2.8, high=3.5, size=self.num_floors).astype(np.float32)
+        masses_per_floor = self.np_random.uniform(low=900.0, high=1200.0, size=self.num_floors).astype(np.float32)
+
+        # 2. Combine into a state vector
+        self.state = np.concatenate([floor_heights, masses_per_floor])
+
+        if not self.quiet:
+            print("\n--- Resetting environment... generating new random state ---")
+            print("New state generated:")
+            print(f"  - Floor Heights (m): {np.round(floor_heights, 2)}")
+            print(f"  - Mass per Floor (kg): {np.round(masses_per_floor, 2)}")
+
+        return self.state
+
+    def step(self, action):
+        """
+        Executes one action in the environment.
+        """
+        if self.state is None:
+            raise RuntimeError("reset() must be called before step().")
+
+        k_shear_values = action
+        if not self.quiet:
+            print(f"\n--- Received action, starting step ---")
+            for i, k_val in enumerate(k_shear_values):
+                print(f"  - Floor {i + 1} Stiffness k_shear: {k_val:.2e} N/m")
+
+        floor_heights = self.state[:self.num_floors]
+        masses_per_floor = self.state[self.num_floors:]
+
+        max_drifts = self._run_opensees_simulation(
+            floor_heights=floor_heights,
+            masses_per_floor=masses_per_floor,
+            k_shear_values=k_shear_values
+        )
+
+        reward = self._calculate_reward(max_drifts)
+        done = True
+        info = {'max_drifts': max_drifts if max_drifts is not None else []}
+
+        return self.state, reward, done, info
+
+    def _calculate_reward(self, max_drifts):
+        """
+        Private method to calculate reward based on maximum inter-story drifts.
+        """
+        if max_drifts is None:
+            reward = -1e6  # Huge penalty for failed analysis
+            if not self.quiet: print("Analysis failed, applying large penalty.")
+        else:
+            reward = -np.sum(max_drifts)
+            if not self.quiet:
+                print(f"Analysis successful. Sum of max drifts: {-reward:.6f} rad")
+                print(f"Calculated reward: {reward:.4f}")
+        return reward
+
+    def _run_opensees_simulation(self, floor_heights, masses_per_floor, k_shear_values):
+        """
+        Private method to build and run the OpenSees inelastic shear model.
+        """
+        ops.wipe()
+        dt = 0.02
+        num_steps = 2000
+        yield_drift_ratio = 0.002
+
+        ops.model('basic', '-ndm', 1, '-ndf', 1)
+        ops.node(0, 0.0)
+        for i in range(self.num_floors):
+            ops.node(i + 1, 0.0)
+        ops.fix(0, 1)
+
+        for i in range(self.num_floors):
+            mat_tag = i + 1
+            k_shear = float(k_shear_values[i])
+            Fy_shear = k_shear * yield_drift_ratio * float(floor_heights[i])
+            ops.uniaxialMaterial("Steel02", mat_tag, Fy_shear, k_shear, 0.01)
+            ops.element("twoNodeLink", i + 1, i, i + 1, "-mat", mat_tag, "-dir", 1)
+
+        for i in range(self.num_floors):
+            ops.mass(i + 1, float(masses_per_floor[i]))
+
+        try:
+            lambda_ = ops.eigen(2)
+            if not lambda_ or len(lambda_) < 2: return None
+            omega_i, omega_j = lambda_[0] ** 0.5, lambda_[1] ** 0.5
+            damping_ratio = 0.05
+            alpha_m = damping_ratio * (2 * omega_i * omega_j) / (omega_i + omega_j)
+            beta_k = damping_ratio * 2 / (omega_i + omega_j)
+            ops.rayleigh(alpha_m, beta_k, 0.0, 0.0)
+        except Exception:
+            return None
+
+        accel_file = "accel.txt"
+        if not os.path.exists(accel_file):
+            with open(accel_file, 'w') as f:
+                time_pts = np.arange(0, num_steps * dt, dt)
+                for t in time_pts: f.write(f"{0.2 * np.sin(np.pi * t)}\n")
+
+        ops.timeSeries("Path", 1, "-dt", dt, "-filePath", accel_file, "-factor", 9.81)
+        ops.pattern("UniformExcitation", 1, 1, "-accel", 1)
+        ops.system("BandGeneral");
+        ops.constraints("Plain");
+        ops.numberer("Plain")
+        ops.algorithm("Newton");
+        ops.integrator("Newmark", 0.5, 0.25);
+        ops.analysis("Transient")
+
+        displacements_x = []
+        for step in range(num_steps):
+            if ops.analyze(1, dt) < 0:
+                ops.wipe();
+                return None
+            displacements_x.append([0.0] + [ops.nodeDisp(i + 1, 1) for i in range(self.num_floors)])
+
+        if not displacements_x: return None
+        disps_array = np.array(displacements_x)
+        interstory_disps = disps_array[:, 1:] - disps_array[:, :-1]
+        drift_ratios = interstory_disps / np.array(floor_heights)
+        max_drifts = np.max(np.abs(drift_ratios), axis=0)
+        ops.wipe()
+        return max_drifts
+
+    def close(self):
+        if not self.quiet: print("Closing environment.")
+        ops.wipe()
+
+
+# ==================================================================
+# --- 2. Custom Callback for Logging during Training ---
+# ==================================================================
+class TrainingProgressCallback(BaseCallback):
+    """ A custom callback to print the mean reward during training. """
+
+    def __init__(self, check_freq: int, verbose=1):
+        super(TrainingProgressCallback, self).__init__(verbose)
+        self.check_freq = check_freq
+
+    def _on_step(self) -> bool:
+        if self.n_calls > 0 and self.n_calls % self.check_freq == 0:
+            if len(self.model.ep_info_buffer) > 0 and 'r' in self.model.ep_info_buffer[-1]:
+                mean_reward = self.model.ep_info_buffer[-1]['r']
+                print(f"Step: {self.num_calls}, Mean Reward: {mean_reward:.2f}")
+        return True
+
+
+# ==================================================================
+# --- 3. Evaluation Function ---
+# ==================================================================
+def evaluate_agent(agent, eval_env, num_episodes=3):
+    """
+    Evaluates the trained agent against a random policy.
+
+    This function runs several test episodes. In each episode, it compares the
+    performance of the agent's chosen action with a randomly sampled action
+    for the same building configuration.
+    """
+    print("\n" + "=" * 60)
+    print("--- Starting Evaluation: Agent vs. Random Policy ---")
+    print("=" * 60)
+
+    for episode in range(num_episodes):
+        print(f"\n--- Evaluation Episode {episode + 1}/{num_episodes} ---")
+        obs = eval_env.reset()
+
+        # --- 1. Agent's Turn ---
+        # Get the agent's best action for the current state (building)
+        # deterministic=True means it picks the single best action it knows
+        agent_action, _ = agent.predict(obs, deterministic=True)
+        # The action from predict is often nested in an extra array, so we take the first element
+        _obs, agent_reward, _done, _info = eval_env.step(agent_action[0])
+
+        print("\n--- Comparison ---")
+        print(f"Building State (Observation):")
+        print(f"  - Heights (m): {np.round(obs[:5], 2)}")
+        print(f"  - Masses (kg): {np.round(obs[5:], 0)}")
+        print("-" * 25)
+
+        print("1. Agent's Policy:")
+        for i, k_val in enumerate(agent_action[0]):
+            print(f"  - Floor {i + 1} k_shear: {k_val:.2e} N/m")
+        print(f"  => Agent's Reward: {agent_reward:.4f}")
+
+        # --- 2. Random Policy's Turn ---
+        # Get a completely random action from the allowed range
+        random_action = eval_env.action_space.sample()
+        _obs, random_reward, _done, _info = eval_env.step(random_action)
+
+        print("\n2. Random Policy:")
+        for i, k_val in enumerate(random_action):
+            print(f"  - Floor {i + 1} k_shear: {k_val:.2e} N/m")
+        print(f"  => Random Reward: {random_reward:.4f}")
+
+        print("-" * 25)
+        if agent_reward > random_reward:
+            print("Result: Agent performed better.")
+        else:
+            print("Result: Random policy performed better or equal.")
+
+
+# ==================================================================
+# --- 4. Main Training Script ---
+# ==================================================================
+if __name__ == "__main__":
+    # --- 4.1. Set Training Parameters ---
+    NUM_FLOORS = 5
+    TOTAL_TIMESTEPS = 5000
+    LOG_FREQ = 250
+    MODEL_PATH = "ppo_opensees_multi_action_model.zip"
+
+    # --- 4.2. Create and Wrap the Environment ---
+    # The main environment for training (can be verbose)
+    env = DummyVecEnv([lambda: OpenSeesEnv(num_floors=NUM_FLOORS, quiet=True)])
+
+    # --- 4.3. Create PPO Agent ---
+    policy_kwargs = dict(activation_fn=torch.nn.ReLU,
+                         net_arch=dict(pi=[128, 128], vf=[128, 128]))
+
+    agent = PPO(
+        "MlpPolicy",
+        env,
+        policy_kwargs=policy_kwargs,
+        verbose=0,
+        tensorboard_log="./ppo_opensees_tensorboard/"
+    )
+
+    print("--- PPO Agent Created ---")
+    print(f"Policy Network Architecture (pi: actor, vf: critic): {policy_kwargs['net_arch']}")
+    print("-" * 50)
+
+    # --- 4.4. Train the Agent ---
+    print(f"--- Starting Training for {TOTAL_TIMESTEPS} Timesteps ---")
+    callback = TrainingProgressCallback(check_freq=LOG_FREQ)
+    agent.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
+    print("--- Training Complete ---")
+
+    # --- 4.5. Save the Trained Model ---
+    agent.save(MODEL_PATH)
+    print(f"\nModel saved to: {MODEL_PATH}")
+
+    # --- 4.6. Evaluate the Trained Agent ---
+    # Create a new, non-vectorized environment for evaluation to show detailed steps
+    eval_env = OpenSeesEnv(num_floors=NUM_FLOORS, quiet=False)
+    evaluate_agent(agent, eval_env, num_episodes=3)
+
+    eval_env.close()
+    env.close()
+

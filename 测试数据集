@@ -1,0 +1,259 @@
+# -*- coding: utf-8 -*-
+import os
+import numpy as np
+import openseespy.opensees as ops
+import gym
+from gym import spaces
+import pandas as pd
+from tqdm import tqdm
+
+
+# ==================================================================
+# --- 1. 自定义 OpenSees 仿真环境 (与之前版本相同) ---
+# ==================================================================
+class OpenSeesEnv(gym.Env):
+    """
+    一个基于OpenSees的自定义仿真环境。
+
+    这个环境模拟了一个多层剪切建筑的非线性动力响应。
+    它被设计为接收一个动作（结构参数），并返回一个基于性能的奖励。
+    """
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, num_floors=5, nonlinear_floor_index=2):
+        """
+        初始化环境。
+        """
+        super(OpenSeesEnv, self).__init__()
+        self.num_floors = num_floors
+        self.nonlinear_floor_index = nonlinear_floor_index
+        if nonlinear_floor_index >= num_floors:
+            raise ValueError("非线性楼层索引必须小于总楼层数。")
+
+        self.state = None
+        self.np_random = np.random.default_rng()
+
+        # 定义动作空间 (Action Space): [k_shear, Fy_shear]
+        self.low_action = np.array([1.0e6, 1.0e5], dtype=np.float32)
+        self.high_action = np.array([1.0e8, 1.0e6], dtype=np.float32)
+        self.action_space = spaces.Box(low=self.low_action, high=self.high_action, dtype=np.float32)
+
+        # 定义观测空间 (Observation Space) - 在此脚本中我们只使用一次
+        low_obs = np.array([2.5] * self.num_floors + [800.0] * self.num_floors, dtype=np.float32)
+        high_obs = np.array([4.0] * self.num_floors + [1500.0] * self.num_floors, dtype=np.float32)
+        self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
+
+    def set_building_properties(self):
+        """
+        生成并固定一个随机的建筑状态（层高和质量），用于整个网格搜索。
+        这确保了所有参数组合都是在同一个建筑模型上进行比较的。
+        """
+        print(f"--- 为 {self.num_floors} 层建筑生成固定的随机属性 ---")
+        floor_heights = self.np_random.uniform(low=2.8, high=3.5, size=self.num_floors).astype(np.float32)
+        masses_per_floor = self.np_random.uniform(low=900.0, high=1200.0, size=self.num_floors).astype(np.float32)
+        self.state = np.concatenate([floor_heights, masses_per_floor])
+        print(f"  - 层高 (m): {np.round(floor_heights, 2)}")
+        print(f"  - 质量 (kg): {np.round(masses_per_floor, 2)}")
+        return self.state
+
+    def run_simulation_for_action(self, action):
+        """
+        在环境中对给定的动作（参数组合）执行一次仿真。
+        """
+        if self.state is None:
+            raise RuntimeError("必须在调用此函数之前调用 set_building_properties()。")
+
+        k_shear, Fy_shear = action
+        floor_heights = self.state[:self.num_floors]
+        masses_per_floor = self.state[self.num_floors:]
+
+        max_drifts = self._run_opensees_simulation(
+            floor_heights=floor_heights,
+            masses_per_floor=masses_per_floor,
+            k_shear=k_shear,
+            Fy_shear=Fy_shear
+        )
+
+        reward = self._calculate_reward(max_drifts)
+        info = {'max_drifts': max_drifts if max_drifts is not None else []}
+
+        return self.state, reward, True, info
+
+    def _calculate_reward(self, max_drifts):
+        """根据最大层间位移角计算奖励。"""
+        if max_drifts is None:
+            return -1e6  # 巨大的惩罚
+        else:
+            return -np.sum(max_drifts)
+
+    def _run_opensees_simulation(self, floor_heights, masses_per_floor, k_shear, Fy_shear):
+        """运行OpenSees非弹性剪切模型。"""
+        ops.wipe()
+        k_shear_f, Fy_shear_f = float(k_shear), float(Fy_shear)
+        dt, num_steps = 0.02, 2000
+
+        ops.model('basic', '-ndm', 1, '-ndf', 1)
+        ops.node(1, 0.0)
+        for i in range(self.num_floors):
+            ops.node(i + 2, 0.0)
+        ops.fix(1, 1)
+
+        ops.uniaxialMaterial("Elastic", 1, k_shear_f)
+        ops.uniaxialMaterial("Steel02", 2, Fy_shear_f, k_shear_f, 0.01)
+        for i in range(self.num_floors):
+            mat_tag = 2 if i == self.nonlinear_floor_index else 1
+            ops.element("twoNodeLink", i + 1, i + 1, i + 2, "-mat", mat_tag, "-dir", 1)
+
+        for i in range(self.num_floors):
+            ops.mass(i + 2, float(masses_per_floor[i]))
+
+        try:
+            lambda_ = ops.eigen(2)
+            if not lambda_ or len(lambda_) < 2:
+                return None
+            omega_i, omega_j = lambda_[0] ** 0.5, lambda_[1] ** 0.5
+            damping_ratio = 0.05
+            alpha_m = damping_ratio * (2 * omega_i * omega_j) / (omega_i + omega_j)
+            beta_k = damping_ratio * 2 / (omega_i + omega_j)
+            ops.rayleigh(alpha_m, beta_k, 0.0, 0.0)
+        except Exception:
+            return None
+
+        accel_file = "accel.txt"
+        if not os.path.exists(accel_file):
+            with open(accel_file, 'w') as f:
+                time_pts = np.arange(0, num_steps * dt, dt)
+                for t in time_pts:
+                    f.write(f"{0.2 * np.sin(np.pi * t)}\n")
+
+        ops.timeSeries("Path", 1, "-dt", dt, "-filePath", accel_file, "-factor", 9.81)
+        ops.pattern("UniformExcitation", 1, 1, "-accel", 1)
+        ops.system("BandGeneral");
+        ops.constraints("Plain");
+        ops.numberer("Plain")
+        ops.algorithm("Newton");
+        ops.integrator("Newmark", 0.5, 0.25);
+        ops.analysis("Transient")
+
+        displacements_x = []
+        for step in range(num_steps):
+            if ops.analyze(1, dt) < 0:
+                ops.wipe()
+                return None
+            displacements_x.append([0.0] + [ops.nodeDisp(i + 2, 1) for i in range(self.num_floors)])
+
+        if not displacements_x: return None
+        disps_array = np.array(displacements_x)
+        interstory_disps = disps_array[:, 1:] - disps_array[:, :-1]
+        drift_ratios = interstory_disps / np.array(floor_heights)
+        max_drifts = np.max(np.abs(drift_ratios), axis=0)
+        ops.wipe()
+        return max_drifts
+
+    def close(self):
+        ops.wipe()
+
+
+# ==================================================================
+# --- 2. 网格搜索执行函数 ---
+# ==================================================================
+def perform_grid_search(num_floors, nonlinear_floor_index, k_steps, fy_steps):
+    """
+    为指定的建筑工况执行完整的参数化网格搜索。
+
+    参数:
+    ----------
+    num_floors : int
+        建筑的楼层数。
+    nonlinear_floor_index : int
+        施加非线性行为的楼层索引。
+    k_steps : int
+        刚度参数的取值点数量。
+    fy_steps : int
+        屈服力参数的取值点数量。
+    """
+    print("\n" + "=" * 60)
+    print(f"开始为 {num_floors} 层建筑工况进行网格搜索 (非线性层: {nonlinear_floor_index})")
+    print("=" * 60)
+
+    # --- 初始化环境并设定固定的建筑属性 ---
+    env = OpenSeesEnv(num_floors=num_floors, nonlinear_floor_index=nonlinear_floor_index)
+    env.set_building_properties()
+
+    # --- 创建参数网格 ---
+    k_shear_values = np.linspace(env.low_action[0], env.high_action[0], k_steps)
+    fy_shear_values = np.linspace(env.low_action[1], env.high_action[1], fy_steps)
+
+    total_simulations = len(k_shear_values) * len(fy_shear_values)
+    print(f"\n--- 开始计算 ---")
+    print(f"总计需要进行 {total_simulations} 次OpenSees仿真...")
+
+    # --- 执行网格搜索 ---
+    results_list = []
+
+    with tqdm(total=total_simulations, desc=f"{num_floors}-Story Search") as pbar:
+        for k_val in k_shear_values:
+            for fy_val in fy_shear_values:
+                action = np.array([k_val, fy_val], dtype=np.float32)
+                state, reward, done, info = env.run_simulation_for_action(action)
+                results_list.append({
+                    'k_shear': k_val,
+                    'fy_shear': fy_val,
+                    'reward': reward,
+                    'sum_max_drifts_rad': -reward if reward > -1e5 else np.nan,
+                    'max_drifts_per_floor': info['max_drifts']
+                })
+                pbar.update(1)
+
+    # --- 分析并保存结果 ---
+    print("\n--- 网格搜索完成 ---")
+    if not results_list:
+        print("错误：没有收集到任何结果。")
+    else:
+        results_df = pd.DataFrame(results_list)
+        output_filename = f"grid_search_results_{num_floors}_floors.csv"
+        results_df.to_csv(output_filename, index=False)
+        print(f"所有结果已保存至: {output_filename}")
+
+        best_result = results_df.loc[results_df['reward'].idxmax()]
+
+        print("\n--- 最优参数组合 ---")
+        print(f"最大奖励值: {best_result['reward']:.4f}")
+        print(f"对应的最小总层间位移角之和: {best_result['sum_max_drifts_rad']:.6f} rad")
+        print(f"最优抗剪刚度 (k_shear): {best_result['k_shear']:.2e} N/m")
+        print(f"最优屈服力 (Fy_shear): {best_result['fy_shear']:.2e} N")
+
+        np.set_printoptions(precision=6, suppress=True)
+        print(f"最优组合下的各楼层最大层间位移角 (rad):\n{np.array(best_result['max_drifts_per_floor'])}")
+
+    env.close()
+
+
+# ==================================================================
+# --- 3. 主脚本 ---
+# ==================================================================
+if __name__ == "__main__":
+    # --- 定义网格搜索的精细度 ---
+    K_SHEAR_STEPS = 10
+    FY_SHEAR_STEPS = 10
+
+    # --- 定义要运行的所有工况 ---
+    # 每个字典代表一个要分析的建筑模型
+    scenarios = [
+        {'num_floors': 4, 'nonlinear_floor_index': 1},
+        {'num_floors': 7, 'nonlinear_floor_index': 3}
+    ]
+
+    # --- 循环执行所有工况的网格搜索 ---
+    for scenario in scenarios:
+        perform_grid_search(
+            num_floors=scenario['num_floors'],
+            nonlinear_floor_index=scenario['nonlinear_floor_index'],
+            k_steps=K_SHEAR_STEPS,
+            fy_steps=FY_SHEAR_STEPS
+        )
+
+    print("\n" + "=" * 60)
+    print("所有指定的工况均已完成分析。")
+    print("=" * 60)
+
